@@ -1,0 +1,85 @@
+/* 1. Colours live in variables on :root (the whole page) */
+:root {
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --text: #222222;
+  --border: #cccccc;
+  --accent: #0ba184;
+  --accent-hover: #088a70;
+}
+
+/* 2. Dark theme: only the variables change */
+body.dark {
+  --bg: #121212;
+  --card: #1e1e1e;
+  --text: #f0f0f0;
+  --border: #444444;
+  --accent: #14b89a;
+  --accent-hover: #0ba184;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Arial, sans-serif;
+  background-color: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+main {
+  max-width: 640px;
+  margin: 24px auto;
+  padding: 20px;
+  background-color: var(--card);
+  border-radius: 10px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+}
+
+label {
+  display: block;
+  font-weight: bold;
+  margin: 16px 0 6px;
+}
+
+textarea {
+  width: 100%;
+  padding: 10px;
+  font: inherit;
+  color: var(--text);
+  background-color: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+button {
+  background-color: var(--accent);
+  color: white;
+  border: none;
+  padding: 10px 18px;
+  border-radius: 6px;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+button:hover {
+  background-color: var(--accent-hover);
+}
+
+/* 3. Character counter states (over comes last so it wins) */
+.warning {
+  color: orange;
+}
+
+.over {
+  color: red;
+  font-weight: bold;
+}
