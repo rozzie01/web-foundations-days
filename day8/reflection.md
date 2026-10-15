@@ -2,8 +2,6 @@
 
 ## 1. Most Difficult Concept
 
-## 1. Most Difficult Concept
-
 The most difficult concept for me was scope. While building the API client for Project 2, I thought a method was missing from `api.js`, because `handleSubmit()` could not use `removeEmptyMessage()`. I looked at my code again and saw that I had written `removeEmptyMessage()` inside `renderNotes()`, so it only existed there. I moved it out so it sat at the top level of the file, next to the other functions. I now understand that a function declared inside another function can only be called from inside it. When something is "not defined", I check where each function starts and ends before I assume it is missing.
 
 ## 2. Improving My Capstone
