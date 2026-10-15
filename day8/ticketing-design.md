@@ -1,5 +1,30 @@
 # TicketHub: Event Ticketing System Design
 
+## Summary
+
+TicketHub sells seats for events to 2 million registered users. A normal day is
+small (about 6 page views and 0.06 sales per second), but a popular sale brings
+200,000 people for 20,000 seats in 10 minutes (about 333 purchase attempts per
+second and 10 buyers per seat). The design is built for that spike and for
+never selling a seat twice.
+
+- **API:** REST endpoints to browse events, view seats, hold seats
+  (`POST /api/events/{eventId}/holds`), pay (`POST /api/orders/{orderId}/payments`
+  plus a payment webhook), view tickets and release a hold.
+- **Data model:** users, events, seats, orders, order items, payments and tickets
+  in PostgreSQL.
+- **Preventing double-booking:** a seat hold is a database transaction that locks
+  the seat rows with `SELECT ... FOR UPDATE`, rechecks their state and changes
+  them from AVAILABLE to HELD. Payment happens outside the transaction, and a
+  payment webhook confirms the seats in a second transaction. A unique constraint
+  on tickets (seat_id) is the last line of defence.
+- **Architecture:** CDN and firewall, a waiting room and rate limiter, a load
+  balancer, stateless application servers, a Redis cache, a PostgreSQL primary
+  with a read replica, a job queue with workers, an external payment provider and
+  monitoring.
+- **Main trade-offs:** fairness versus speed (waiting room), speed versus freshness
+  (cached seat availability) and correctness versus throughput (row locks).
+
 ## 1. Context
 
 TicketHub is an online event ticketing platform where users can
@@ -23,15 +48,11 @@ ensuring that the same seat cannot be sold to more than one customer.
 - Process payments and confirm successful orders.
 - Allow users to view their purchased tickets.
 - Prevent two customers from purchasing the same seat.
-- Remain responsive during high-demand ticket sales.
-- Protect user accounts and payment-related information.
 
 ### Non-Goals
 
 - Building a social network for event attendees.
 - Organizing or managing the concerts themselves.
-- Developing a custom payment processing system.
-- Providing live video streaming of events.
 
 ## 3. Requirements
 
@@ -57,32 +78,25 @@ ensuring that the same seat cannot be sold to more than one customer.
 - Event listings should load quickly under normal traffic.
 - Seat availability and booking requests should receive timely
   responses, including during popular sales.
-- The system should monitor response times and errors.
 
 **Correctness and consistency**
 - A seat must never be sold to two customers.
 - An order must not be marked as paid without verified payment.
 - Expired seat holds must not be treated as valid reservations.
-- Database transactions and constraints must protect booking operations.
 
 **Fairness**
 - A virtual waiting room should manage demand during exceptionally
   popular sales.
 - Requests should be admitted according to a consistent queue policy.
-- Rate limits should reduce abuse without unfairly favoring customers
-  who send excessive requests.
 
 **Availability and reliability**
 - Multiple application servers should allow the service to continue
   operating if one server fails.
 - The database should have backups and a tested recovery procedure.
-- Failed background jobs should be retried safely.
 
 **Security**
 - Private account and ticket information must require authentication.
 - Users must only access orders and tickets they are authorized to view.
-- Payment details should be handled by a trusted payment provider.
-- Inputs must be validated, and sensitive information must be protected.
 
 **Scalability**
 - The system should scale its application servers to handle demand.
@@ -118,13 +132,8 @@ Normal ticket sales:
 
 This is approximately 208 tickets per hour on average.
 
-These averages do not represent peak traffic. Actual traffic may
-be higher during busy periods.
 
 ### 4.3 Popular Sale Traffic
-
-The popular sale attracts 200,000 purchase attempts within
-10 minutes.
 
 10 minutes = 600 seconds.
 
@@ -169,6 +178,24 @@ Peak API traffic may exceed the purchase-attempt rate because
 each customer can make several API requests. Further capacity
 planning would require assumptions about the number of requests
 per customer and the concentration of requests during the sale.
+
+### 4.6 Normal Day Compared with the Popular Sale
+
+To compare total traffic, I assume each buyer makes about 10 requests during
+the sale (the event page, several refreshes of the seat map, one or more seat
+holds and the payment steps) and about 3 seat-hold attempts.
+
+| Item | Normal day | Popular sale |
+|------|------------|--------------|
+| All requests | about 5.8 per second on average, about 29 at a 5x peak | 200,000 x 10 = 2,000,000 in 600 s, about 3,333 per second on average, about 16,700 at a 5x peak |
+| Seat-hold attempts | not applicable | 200,000 x 3 = 600,000 in 600 s, about 1,000 per second |
+| Successful purchases | about 0.058 per second | at most 20,000 in 600 s, about 33 per second |
+
+The popular sale is therefore roughly 575 times busier than a normal day, but
+only for about 10 minutes. Most of that traffic is reading (browsing and
+refreshing seats), while the writes that matter (holding and buying seats) are
+concentrated on the same 20,000 rows. About 9 out of every 10 buyers will not
+get a seat, so unsuccessful attempts must fail quickly and clearly.
 
 ## 5. API Design
 
@@ -265,6 +292,8 @@ Possible errors:
 The reservation is created within a database transaction so that
 concurrent requests cannot reserve the same available seat.
 
+During a popular sale, requests must include a short-lived admission token issued by the waiting room, otherwise the API returns 403 Forbidden.
+
 ### 5.4 Initiate Payment
 
 POST /api/orders/{orderId}/payments
@@ -291,8 +320,6 @@ HTTP 202 Accepted
   "message": "Payment initiated"
 }
 
-The payment provider processes the payment. The order is not
-confirmed merely because payment was initiated.
 
 ### 5.5 Receive Payment Notifications
 
@@ -334,9 +361,6 @@ HTTP 200 OK
   ]
 }
 
-The backend derives the user identity from the authenticated
-session or access token. It must not trust a user ID supplied
-by the client to determine ticket ownership.
 
 ### 5.7 Release a Seat Hold
 
@@ -467,6 +491,24 @@ Records payment attempts and their results.
 A payment-provider reference must be unique to prevent the same
 provider transaction from being recorded more than once.
 
+#### Tickets
+
+Stores a ticket for each seat that has been sold.
+
+- ticket_id: primary key.
+- order_item_id: foreign key referencing order items.
+- seat_id: foreign key referencing seats.
+- created_at: ticket creation timestamp.
+
+Constraint:
+
+UNIQUE (seat_id)
+
+A seat can only ever have one ticket. A ticket is created only when a payment
+is confirmed, in the same transaction that marks the seat SOLD. Even if there
+were a bug in the application code, the database would refuse to create a second
+ticket for the same seat.
+
 ### 6.2 Relationships
 
 - One user can create many orders.
@@ -476,6 +518,7 @@ provider transaction from being recorded more than once.
 - One order can contain many order items.
 - Each order item references one seat.
 - One order can have multiple payment attempts.
+- Each paid order item has one ticket, and each seat has at most one ticket.
 
 The database uses primary keys to identify records and foreign
 keys to maintain referential integrity.
@@ -499,7 +542,9 @@ When a customer requests seats:
 2. The backend starts a database transaction.
 3. The backend locks the requested seat rows using
    SELECT ... FOR UPDATE.
+   Seats are locked in ascending seat_id order, so two requests for overlapping seats cannot deadlock.
 4. The backend checks the current state of every requested seat.
+A seat that is HELD but whose hold_expires_at is in the past is treated as available.
 5. If any requested seat is unavailable, the transaction does not
    create a successful reservation.
 6. If all requested seats are available, the backend creates a
@@ -563,6 +608,7 @@ been sold.
 - Change seat status through controlled transactional operations.
 - Use idempotency keys to recognize repeated reservation and
   payment requests.
+ - Use UNIQUE (seat_id) on tickets as a last line of defence against selling a seat twice.
 
 ### 7.5 Result
 
@@ -614,3 +660,119 @@ flowchart TD
     A1 --> MON
     A2 --> MON
     A3 --> MON
+
+
+The diagram follows a request from the customer to the database. Browsing is
+separated from seat booking: public pages, cached data and the read replica
+serve reads, while seat holds and payment confirmations are written only to the
+PostgreSQL primary.
+
+### 8.2 What Each Component Does
+
+- **Customers (browser or mobile app)** use the website and send requests, which
+  gives people a way to use the system.
+- **CDN and WAF** serve static files and public event pages from servers near the
+  customer, and the web application firewall blocks malicious traffic, which keeps
+  most browsing traffic and attacks away from the application servers.
+- **Virtual waiting room and rate limiter** admit customers to a popular sale at a
+  controlled rate, in the order they arrived, and slow down clients that send too
+  many requests, which stops the servers and database from being overwhelmed and
+  keeps the sale fair.
+- **Load balancer** spreads requests across the application servers and stops
+  sending requests to a server that fails its health check, so one failed server
+  does not stop the service.
+- **Application servers (1 to 3, and more when needed)** run the API logic. They are
+  stateless, so extra servers can be added before a popular sale and removed
+  afterwards.
+- **Redis cache** keeps event details and a one-to-two-second copy of seat
+  availability in memory, so thousands of customers can look at seats without every
+  request reaching the database.
+- **PostgreSQL primary** is the single source of truth for seats, orders and
+  payments, and the only place where seats are held and sold, so transactions and
+  row locks can prevent double-booking.
+- **Read replica** is a live copy of the primary that answers browsing queries,
+  which keeps read traffic away from the primary and gives a spare copy if the
+  primary fails.
+- **Background job queue and workers** run slow work outside the customer's request:
+  sending emails and ticket notifications, releasing expired holds and retrying
+  failed jobs safely.
+- **External payment provider** takes the payment and handles sensitive payment
+  details, so TicketHub never stores them, and it reports the result by webhook.
+- **Monitoring and alerts** track response times, error rates, database contention,
+  queue length and payment failures, so engineers see a problem before customers do.
+
+### 8.3 Flow of a Popular Sale
+
+1. Before the sale, extra application servers are started and the waiting room is
+   switched on for the event.
+2. When the sale opens, customers enter the waiting room and are admitted at a
+   steady rate, in the order they arrived. An admitted customer receives a
+   short-lived admission token.
+3. The customer views the event and the seat map. These reads come from the CDN,
+   the Redis cache and the read replica, and are informational.
+4. The customer chooses seats and sends `POST /api/events/{eventId}/holds`. The
+   application server checks the token, starts a transaction on the primary
+   database, locks the seat rows and checks them (section 7.1).
+5. If a seat is taken, the customer gets `409 Conflict` and chooses again. If the
+   seats are free, they are held and the customer has a limited time to pay.
+6. The customer pays through the payment provider. No database lock is held while
+   the customer or the provider is working.
+7. The provider sends a webhook. The server verifies it and, in a new transaction,
+   marks the order PAID and the seats SOLD (section 7.2).
+8. A worker sends the ticket notification. If the customer never pays, the hold
+   expires and a worker releases the seats (section 7.3).
+
+### 8.4 What Breaks First and How the Design Survives the Sale
+
+**What breaks first?** The PostgreSQL primary, because every seat hold and
+purchase for the popular event writes to the same small group of rows, and
+customers who want the same seats wait for each other's locks. After that, the
+application servers' CPU, and then the payment provider's limits.
+
+**How the design survives**
+- The waiting room limits how many customers reach the servers and the database
+  at the same moment.
+- The CDN, the cache and the read replica take most of the read traffic, so the
+  primary is kept for seat holds and payments.
+- A hold is a short transaction, so each lock is held for a very short time, and
+  unsuccessful attempts end quickly with a 409.
+- Payment is outside the transaction, so a slow payment never holds a lock.
+- Rate limits stop bots and repeated refreshing.
+- Application servers are added before the sale, because the sale time is known.
+
+### 8.5 Trade-offs
+
+1. **Fairness versus speed.** The waiting room makes some customers wait, but it
+   protects the system from being overwhelmed and keeps the sale fair. Without it,
+   the system could fail and nobody would be able to buy.
+2. **Speed versus freshness.** Seat availability is cached for a short time, so a
+   customer may click a seat that was just taken and get a 409. This is acceptable
+   because the final decision always comes from the primary database, so
+   correctness is never at risk, and the database is protected from thousands of
+   seat-map refreshes.
+3. **Correctness versus throughput.** Row locks make sure only one customer can
+   hold a seat, but customers who want the same seat have to wait for each other.
+   We accept this because selling a seat twice is far worse than a short wait, and
+   we keep the transactions very short.
+4. **Holding seats versus selling more seats.** A hold gives customers time to pay,
+   but it keeps the seat away from other customers while the holder decides. A
+   short hold time and a worker that quickly releases expired holds keep this cost
+   low.
+5. **Simplicity versus scalability.** We use one primary database and no
+   sharding. This is simpler to build and to keep correct, and the waiting room
+   limits the load on it. If one popular event ever became too much for a single
+   primary, the data could be split by event.
+
+### 8.6 Single Points of Failure
+
+- **Application servers:** several identical servers behind the load balancer, which
+  skips unhealthy ones.
+- **Load balancer:** a redundant pair or a managed cloud load balancer.
+- **Primary database:** the read replica can be promoted to primary (failover), and
+  backups are stored separately and restored in tests.
+- **Cache and waiting room:** if Redis fails, requests fall back to the database
+  and the waiting room can be rebuilt, with a short pause in the sale.
+- **Queue and workers:** jobs wait safely in the queue and extra workers can be
+  started.
+- **Payment provider:** payment requests use timeouts and idempotency keys, and
+  orders stay in a pending state until the result is known.
